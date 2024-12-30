@@ -2,13 +2,14 @@
 /*
  * SPDX-License-Identifier: GPL-2.0-only
  *
- * Copyright (C) 2023 ImmortalWrt.org
+ * Copyright (C) 2023-2024 ImmortalWrt.org
  */
 
 'use strict';
 
 import { readfile, writefile } from 'fs';
 import { isnan } from 'math';
+import { connect } from 'ubus';
 import { cursor } from 'uci';
 
 import {
@@ -16,6 +17,10 @@ import {
 	removeBlankAttrs, validateHostname, validation,
 	HP_DIR, RUN_DIR
 } from 'homeproxy';
+
+const ubus = connect();
+
+const features = ubus.call('luci.homeproxy', 'singbox_get_features') || {};
 
 /* UCI config start */
 const uci = cursor();
@@ -41,17 +46,15 @@ const uciruleset = 'ruleset';
 
 const routing_mode = uci.get(uciconfig, ucimain, 'routing_mode') || 'bypass_mainland_china';
 
-let wan_dns = executeCommand('ifstatus wan | jsonfilter -e \'@["dns-server"][0]\'');
-if (wan_dns.exitcode === 0 && trim(wan_dns.stdout))
-	wan_dns = trim(wan_dns.stdout);
-else
-	wan_dns = (routing_mode in ['proxy_mainland_china', 'global']) ? '208.67.222.222' : '114.114.114.114';
+let wan_dns = ubus.call('network.interface', 'status', {'interface': 'wan'})?.['dns-server']?.[0];
+if (!wan_dns)
+	wan_dns = (routing_mode in ['proxy_mainland_china', 'global']) ? '8.8.8.8' : '223.5.5.5';
 
 const dns_port = uci.get(uciconfig, uciinfra, 'dns_port') || '5333';
 
-let main_node, main_udp_node, dedicated_udp_node, default_outbound, sniff_override = '1',
+let main_node, main_udp_node, dedicated_udp_node, default_outbound, domain_strategy, sniff_override = '1',
     dns_server, dns_default_strategy, dns_default_server, dns_disable_cache, dns_disable_cache_expire,
-    dns_independent_cache, dns_client_subnet, direct_domain_list;
+    dns_independent_cache, dns_client_subnet, direct_domain_list, proxy_domain_list;
 
 if (routing_mode !== 'custom') {
 	main_node = uci.get(uciconfig, ucimain, 'main_node') || 'nil';
@@ -65,6 +68,10 @@ if (routing_mode !== 'custom') {
 	direct_domain_list = trim(readfile(HP_DIR + '/resources/direct_list.txt'));
 	if (direct_domain_list)
 		direct_domain_list = split(direct_domain_list, /[\r\n]/);
+
+	proxy_domain_list = trim(readfile(HP_DIR + '/resources/proxy_list.txt'));
+	if (proxy_domain_list)
+		proxy_domain_list = split(proxy_domain_list, /[\r\n]/);
 } else {
 	/* DNS settings */
 	dns_default_strategy = uci.get(uciconfig, ucidnssetting, 'default_strategy');
@@ -76,6 +83,7 @@ if (routing_mode !== 'custom') {
 
 	/* Routing settings */
 	default_outbound = uci.get(uciconfig, uciroutingsetting, 'default_outbound') || 'nil';
+	domain_strategy = uci.get(uciconfig, uciroutingsetting, 'domain_strategy');
 	sniff_override = uci.get(uciconfig, uciroutingsetting, 'sniff_override');
 }
 
@@ -97,7 +105,10 @@ const enable_clash_api = uci.get(uciconfig, uciexp, 'enable_clash_api'),
 const mixed_port = uci.get(uciconfig, uciinfra, 'mixed_port') || '5330';
 let self_mark, redirect_port, tproxy_port,
     tun_name, tun_addr4, tun_addr6, tun_mtu, tun_gso,
-    tcpip_stack, endpoint_independent_nat;
+    tcpip_stack, endpoint_independent_nat, udp_timeout;
+udp_timeout = uci.get(uciconfig, 'infra', 'udp_timeout');
+if (routing_mode === 'custom')
+	udp_timeout = uci.get(uciconfig, uciroutingsetting, 'udp_timeout');
 if (match(proxy_mode, /redirect/)) {
 	self_mark = uci.get(uciconfig, 'infra', 'self_mark') || '100';
 	redirect_port = uci.get(uciconfig, 'infra', 'redirect_port') || '5331';
@@ -110,7 +121,7 @@ if (match(proxy_mode), /tun/) {
 	tun_addr4 = uci.get(uciconfig, uciinfra, 'tun_addr4') || '172.19.0.1/30';
 	tun_addr6 = uci.get(uciconfig, uciinfra, 'tun_addr6') || 'fdfe:dcba:9876::1/126';
 	tun_mtu = uci.get(uciconfig, uciinfra, 'tun_mtu') || '9000';
-	tun_gso = '0';
+	tun_gso = uci.get(uciconfig, uciinfra, 'tun_gso') || '0';
 	tcpip_stack = 'system';
 	if (routing_mode === 'custom') {
 		tun_gso = uci.get(uciconfig, uciroutingsetting, 'tun_gso') || '0';
@@ -173,6 +184,7 @@ function generate_outbound(node) {
 		/* Direct */
 		override_address: node.override_address,
 		override_port: strToInt(node.override_port),
+		proxy_protocol: strToInt(node.proxy_protocol),
 		/* Hysteria (2) */
 		up_mbps: strToInt(node.hysteria_up_mbps),
 		down_mbps: strToInt(node.hysteria_down_mbps),
@@ -212,9 +224,7 @@ function generate_outbound(node) {
 		authenticated_length: node.vmess_authenticated_length ? (node.vmess_authenticated_length === '1') : null,
 		packet_encoding: node.packet_encoding,
 		/* WireGuard */
-		system_interface: (node.type === 'wireguard') || null,
 		gso: (node.wireguard_gso === '1') || null,
-		interface_name: (node.type === 'wireguard') ? 'wg-' + node['.name'] + '-out' : null,
 		local_address: node.wireguard_local_address,
 		private_key: node.wireguard_private_key,
 		peer_public_key: node.wireguard_peer_public_key,
@@ -248,7 +258,8 @@ function generate_outbound(node) {
 				enabled: true,
 				dynamic_record_sizing_disabled: (node.tls_ech_tls_disable_drs === '1'),
 				pq_signature_schemes_enabled: (node.tls_ech_enable_pqss === '1'),
-				config: node.tls_ech_config
+				config: node.tls_ech_config,
+				config_path: node.tls_ech_config_path
 			} : null,
 			utls: !isEmpty(node.tls_utls) ? {
 				enabled: true,
@@ -394,6 +405,14 @@ if (!isEmpty(main_node)) {
 			server: 'default-dns'
 		});
 
+	/* Filter out SVCB/HTTPS queries for "exquisite" Apple devices */
+	if (routing_mode === 'gfwlist' || proxy_domain_list)
+		push(config.dns.rules, {
+			domain_keyword: (routing_mode !== 'gfwlist') ? proxy_domain_list : null,
+			query_type: [64, 65],
+			server: 'block-dns'
+		});
+
 	if (isEmpty(config.dns.rules))
 		config.dns.rules = null;
 
@@ -453,9 +472,11 @@ if (!isEmpty(main_node)) {
 			source_port_range: cfg.source_port_range,
 			process_name: cfg.process_name,
 			process_path: cfg.process_path,
+			process_path_regex: cfg.process_path_regex,
 			user: cfg.user,
 			rule_set: get_ruleset(cfg.rule_set),
-			rule_set_ipcidr_match_source: (cfg.rule_set_ipcidr_match_source === '1') || null,
+			/* rule_set_ipcidr_match_source is deprecated in sing-box 1.10.0 */
+			rule_set_ip_cidr_match_source: (cfg.rule_set_ip_cidr_match_source  === '1') || null,
 			invert: (cfg.invert === '1') || null,
 			clash_mode: cfg.clash_mode,
 			outbound: cfg.outbound,
@@ -488,8 +509,10 @@ push(config.inbounds, {
 	tag: 'mixed-in',
 	listen: '::',
 	listen_port: int(mixed_port),
+	udp_timeout: udp_timeout ? (udp_timeout + 's') : null,
 	sniff: true,
 	sniff_override_destination: (sniff_override === '1'),
+	domain_strategy: domain_strategy,
 	set_system_proxy: false
 });
 
@@ -501,7 +524,8 @@ if (match(proxy_mode, /redirect/))
 		listen: '::',
 		listen_port: int(redirect_port),
 		sniff: true,
-		sniff_override_destination: (sniff_override === '1')
+		sniff_override_destination: (sniff_override === '1'),
+		domain_strategy: domain_strategy,
 	});
 if (match(proxy_mode, /tproxy/))
 	push(config.inbounds, {
@@ -511,8 +535,10 @@ if (match(proxy_mode, /tproxy/))
 		listen: '::',
 		listen_port: int(tproxy_port),
 		network: 'udp',
+		udp_timeout: udp_timeout ? (udp_timeout + 's') : null,
 		sniff: true,
-		sniff_override_destination: (sniff_override === '1')
+		sniff_override_destination: (sniff_override === '1'),
+		domain_strategy: domain_strategy,
 	});
 if (match(proxy_mode, /tun/))
 	push(config.inbounds, {
@@ -520,15 +546,17 @@ if (match(proxy_mode, /tun/))
 		tag: 'tun-in',
 
 		interface_name: tun_name,
-		inet4_address: tun_addr4,
-		inet6_address: (ipv6_support === '1') ? tun_addr6 : null,
+		/* inet4_address and inet6_address are deprecated in sing-box 1.10.0 */
+		address: (ipv6_support === '1') ? [tun_addr4, tun_addr6] : [tun_addr4],
 		mtu: strToInt(tun_mtu),
 		gso: (tun_gso === '1'),
 		auto_route: false,
 		endpoint_independent_nat: strToBool(endpoint_independent_nat),
+		udp_timeout: udp_timeout ? (udp_timeout + 's') : null,
 		stack: tcpip_stack,
 		sniff: true,
 		sniff_override_destination: (sniff_override === '1'),
+		domain_strategy: domain_strategy,
 	});
 /* Inbound end */
 
@@ -577,10 +605,6 @@ config.route = {
 		{
 			inbound: 'dns-in',
 			outbound: 'dns-out'
-		},
-		{
-			protocol: 'dns',
-			outbound: 'dns-out'
 		}
 	],
 	rule_set: [],
@@ -628,9 +652,12 @@ if (!isEmpty(main_node)) {
 			port_range: cfg.port_range,
 			process_name: cfg.process_name,
 			process_path: cfg.process_path,
+			process_path_regex: cfg.process_path_regex,
 			user: cfg.user,
 			rule_set: get_ruleset(cfg.rule_set),
-			rule_set_ipcidr_match_source: (cfg.rule_set_ipcidr_match_source === '1') || null,
+			/* rule_set_ipcidr_match_source is deprecated in sing-box 1.10.0 */
+			rule_set_ip_cidr_match_source: (cfg.rule_set_ip_cidr_match_source  === '1') || null,
+			rule_set_ip_cidr_accept_empty: (cfg.rule_set_ip_cidr_accept_empty === '1') || null,
 			invert: (cfg.invert === '1') || null,
 			clash_mode: cfg.clash_mode,
 			outbound: cfg.outbound
@@ -664,7 +691,7 @@ if (routing_mode === 'custom') {
 	config.experimental = {
 		cache_file: {
 			enabled: true,
-			path: HP_DIR + '/cache.db',
+			path: RUN_DIR + '/cache.db',
 			store_rdrc: (cache_file_store_rdrc === '1') || null,
 			rdrc_timeout: cache_file_rdrc_timeout
 		},
