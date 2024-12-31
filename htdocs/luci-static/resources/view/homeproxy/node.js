@@ -523,7 +523,7 @@ function renderNodeSettings(section, data, features, main_node, routing_mode) {
 	o = s.option(form.Flag, 'interrupt_exist_connections', _('Interrupt exist connections'),
 		_('Interrupt existing connections when the selected outbound has changed.<br/>' +
 			'Only inbound connections are affected by this setting, internal connections will always be interrupted.'));
-	o.default = so.disabled;
+	o.default = o.disabled;
 	o.depends('type', 'urltest');
 	o.depends('type', 'selector');
 	o.modalonly = true;
